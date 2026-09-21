@@ -1,0 +1,21 @@
+package com.github.h3yow.pipelinereleaseorchestratorjava.model;
+
+public enum EventType {
+    DEFINITION_CREATED,
+    DEFINITION_WITHDRAWN,
+    RUN_SUBMITTED,
+    RUN_DEDUPLICATED,
+    RUN_STARTED,
+    STAGE_STARTED,
+    STAGE_SUCCEEDED,
+    STAGE_FAILED,
+    RUN_RETRY,
+    RUN_CANCELLED,
+    RUN_SUCCEEDED,
+    RUN_FAILED,
+    PROMOTED,
+    RELEASE_PUBLISHED,
+    RELEASE_SUPERSEDED,
+    RELEASE_ROLLED_BACK,
+    SUBMISSION_REJECTED
+}
