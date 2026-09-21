@@ -1,0 +1,25 @@
+package com.github.h3yow.pipelinereleaseorchestratorjava.model;
+
+/** Audit event type constants. */
+public enum AuditType {
+    DEFINITION_CREATED,
+    DEFINITION_WITHDRAWN,
+    RUN_SUBMITTED,
+    RUN_SUBMIT_DEDUP,
+    RUN_REJECTED,
+    RUN_STAGE_STARTED,
+    RUN_STAGE_SUCCEEDED,
+    RUN_STAGE_FAILED,
+    RUN_STATUS_CHANGED,
+    RUN_RETRY_SCHEDULED,
+    RUN_RETRIED,
+    RUN_CANCEL_REQUESTED,
+    RUN_CANCELLED,
+    RUN_SUCCEEDED,
+    RUN_FAILED,
+    ENV_PROMOTED,
+    RELEASE_PUBLISHED,
+    RELEASE_SUPERSEDED,
+    RELEASE_ROLLED_BACK,
+    OVERFLOW
+}
