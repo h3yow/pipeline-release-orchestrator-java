@@ -14,7 +14,10 @@ import com.github.h3yow.pipelinereleaseorchestratorjava.model.StageSpec;
 import com.github.h3yow.pipelinereleaseorchestratorjava.service.DefinitionService;
 import com.github.h3yow.pipelinereleaseorchestratorjava.service.Hashes;
 import com.github.h3yow.pipelinereleaseorchestratorjava.service.PipelineLockManager;
+import com.github.h3yow.pipelinereleaseorchestratorjava.service.RunService;
 import com.github.h3yow.pipelinereleaseorchestratorjava.store.LocalStateStore;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
@@ -28,12 +31,22 @@ public class DefaultDefinitionService implements DefinitionService {
     private final PipelineLockManager locks;
     private final AuditSupport audit;
     private final ObjectMapper contentMapper;
+    /**
+     * Setter-injected to break the constructor cycle (runs depend on definitions).
+     * Used to terminate in-flight runs when a definition version is withdrawn.
+     */
+    private RunService runService;
 
     public DefaultDefinitionService(LocalStateStore store, PipelineLockManager locks, AuditSupport audit) {
         this.store = store;
         this.locks = locks;
         this.audit = audit;
         this.contentMapper = new ObjectMapper().findAndRegisterModules();
+    }
+
+    @Autowired(required = false)
+    public void setRunService(@Lazy RunService runService) {
+        this.runService = runService;
     }
 
     @Override
@@ -54,17 +67,27 @@ public class DefaultDefinitionService implements DefinitionService {
 
     @Override
     public DefinitionVersion withdraw(String pipelineName, int version, String reason) {
+        // Flip the volatile status BEFORE acquiring the pipeline lock: a drive loop
+        // currently executing a stage of this version on another thread observes the
+        // withdrawal between stages and never executes the withdrawn version again.
+        DefinitionVersion early = mustFind(pipelineName, version);
+        early.setStatus(DefinitionStatus.WITHDRAWN);
         return locks.withLock(pipelineName, () -> {
             DefinitionVersion dv = mustFind(pipelineName, version);
-            if (dv.getStatus() == DefinitionStatus.WITHDRAWN) {
-                return dv;
+            boolean firstWithdrawal = dv.getWithdrawnAt() == null;
+            if (firstWithdrawal) {
+                dv.setWithdrawnAt(Instant.now());
+                dv.setWithdrawReason(reason);
+                store.persistSnapshot();
+                audit.emit(AuditType.DEFINITION_WITHDRAWN, pipelineName, version,
+                        null, null, null, null, null, reason);
             }
-            dv.setStatus(DefinitionStatus.WITHDRAWN);
-            dv.setWithdrawnAt(Instant.now());
-            dv.setWithdrawReason(reason);
-            store.persistSnapshot();
-            audit.emit(AuditType.DEFINITION_WITHDRAWN, pipelineName, version,
-                    null, null, null, null, null, reason);
+            // Terminate accepted-but-unfinished runs bound to this version (queued,
+            // backing off or running); they converge to INVALIDATED, distinct from
+            // failure and cancellation. Other versions, runs and releases are untouched.
+            if (runService != null) {
+                runService.invalidateRunsForWithdrawnVersion(pipelineName, version, reason);
+            }
             return dv;
         });
     }

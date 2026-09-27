@@ -8,7 +8,11 @@ public final class DefinitionVersion {
     private String pipelineName;
     private int version;
     private PipelineDefinition definition;
-    private DefinitionStatus status;
+    /**
+     * Volatile so a drive loop executing stages on another thread observes a
+     * withdrawal between stages without waiting for the pipeline lock.
+     */
+    private volatile DefinitionStatus status;
     private String contentHash;
     private Instant createdAt;
     private Instant withdrawnAt;

@@ -93,6 +93,12 @@ public class OrchestratorController {
         return runs.cancel(runId, request == null ? null : request.reason());
     }
 
+    @PostMapping("/api/runs/{runId}/abort")
+    public PipelineRun abort(@PathVariable String runId,
+                             @RequestBody(required = false) Requests.AbortRequest request) {
+        return runs.abort(runId, request == null ? null : request.reason());
+    }
+
     // ------------------------------------------------------------- releases
 
     @PostMapping("/api/runs/{runId}/promote")

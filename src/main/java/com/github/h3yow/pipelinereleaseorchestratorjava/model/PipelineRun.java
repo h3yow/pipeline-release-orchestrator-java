@@ -18,6 +18,14 @@ public final class PipelineRun {
     private int retryAttempts;
     private Instant retryNotBefore;
     private boolean cancelRequested;
+    /**
+     * Lock-free stop signal for immediate abort: set before the pipeline lock is
+     * acquired so a drive loop executing a long stage on another thread observes it
+     * (and its executing thread is interrupted) as early as possible.
+     */
+    private volatile boolean abortRequested;
+    /** Reason supplied by the abort trigger; read by the drive loop when converging. */
+    private volatile String abortReason;
     private boolean queued;
     private Instant createdAt;
     private Instant updatedAt;
@@ -115,6 +123,22 @@ public final class PipelineRun {
 
     public void setCancelRequested(boolean cancelRequested) {
         this.cancelRequested = cancelRequested;
+    }
+
+    public boolean isAbortRequested() {
+        return abortRequested;
+    }
+
+    public void setAbortRequested(boolean abortRequested) {
+        this.abortRequested = abortRequested;
+    }
+
+    public String getAbortReason() {
+        return abortReason;
+    }
+
+    public void setAbortReason(String abortReason) {
+        this.abortReason = abortReason;
     }
 
     /** True when the run is PENDING only because of the in-flight cap (QUEUE policy). */

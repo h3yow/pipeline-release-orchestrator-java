@@ -37,6 +37,10 @@ config/     OrchestratorProperties（资源上限、退避、存储、溢出策�
   自增版本号 `v1, v2, ...`、内容 SHA-256 哈希、`ACTIVE` 状态、创建时间。
 - 旧版本快照永不被原地修改；新版本是全新对象，历史版本的阶段、环境、重试策略保持不变。
 - `withdraw(pipeline, v, reason)` 将版本置为 `WITHDRAWN` 并记录撤回时间与原因。
+  **撤回会立即作用于在途运行**：状态翻转是 lock-free 的（`volatile`），正在执行该版本的
+  推进循环会在当前阶段结束后、下一阶段开始前观察到撤回并停止继续执行该版本；
+  已受理但未结束（排队中 / 退避等待中 / 执行中）的运行以 `INVALIDATED` 终态收敛
+  （详见 §4.2）。
 - **运行必须绑定确定的定义版本**（提交时显式传 `definitionVersion`）。
   执行前经 `resolveExecutable` 校验，非法版本被拒绝并给出**可区分原因码**：
 
@@ -74,6 +78,9 @@ CANCELLED             ├──────────────────�
                       │
                       └─cancel(运行中)─> CANCELLING ─在阶段边界收敛─> CANCELLED
 WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
+
+任意非终态 ─abort──> ABORTED            (终态；打断在途阶段，见 §4.1)
+任意非终态 ─绑定版本被撤回──> INVALIDATED  (终态；区别于失败与取消，见 §4.2)
 ```
 
 - 阶段严格按定义顺序执行。只有「下一个 `PENDING` 阶段」可执行；
@@ -101,6 +108,57 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 - **取消幂等**：对已 CANCELLED 重复取消状态不变；对 SUCCEEDED/FAILED 终态取消抛
   `CANCEL_NOT_ALLOWED`，历史不被翻转。
 - 取消与重试并发时由同一把锁串行化，最终**必然收敛到单一终态**，不会 CANCELLED↔RUNNING 抖动。
+
+### 4.1 立即中止（abort）
+
+`abort(runId, reason)` 用于「运行跑到一半必须马上叫停」的场景，语义强于 `cancel`：
+
+- **尽快打断在途阶段**：中止意图（`abortRequested` + 原因）在获取流水线锁**之前**就以
+  `volatile` 方式写到运行对象上，并 `interrupt()` 正在执行阶段的线程；推进循环在阶段
+  结束后、下一阶段开始前检查该标志，立即收敛到 `ABORTED`，**不再执行任何后续阶段**。
+  若阶段处理器响应中断（如可中断的等待/IO），长阶段会被当场打断；否则在当前阶段
+  完成后、下一阶段开始前停止。
+- **阶段结果如实保留**：中止前已跑完的阶段保持 `SUCCEEDED`；被打断的阶段标记为
+  `StageStatus.ABORTED`（绝不记为成功）；从未执行的阶段保持 `PENDING`，不留成功痕迹。
+- **唯一终态**：运行收敛到终态 `ABORTED`，`failureCode=RUN_ABORTED`，
+  `failureReason` 记录触发原因；运行详情（`GET /api/runs/{runId}`）可直接读出，
+  完整状态流转顺序由审计事件（`RUN_ABORT_REQUESTED` / `RUN_STAGE_ABORTED` /
+  `RUN_ABORTED`，各带 from→to 状态）还原。
+- **幂等与拒绝**：重复中止不改变结果（仍 `ABORTED`，`finishedAt` 不变）；对已进入
+  其它终态（SUCCEEDED/FAILED/CANCELLED/INVALIDATED）的运行中止抛
+  `ABORT_NOT_ALLOWED`（HTTP 422），与 `CANCEL_NOT_ALLOWED` 可区分，且不会在已结束的
+  运行上留下中止痕迹。
+- **与取消的关系**：中止优先于取消——并发发起时若中止先生效，运行收敛 `ABORTED`，
+  随后的取消按「终态不可取消」拒绝；反之取消先收敛则中止按 `ABORT_NOT_ALLOWED` 拒绝。
+  两者都由同一把流水线锁串行化，不会出现状态反复或半更新。
+
+### 4.2 定义版本运行中途失效（withdraw → INVALIDATED）
+
+版本撤回不再只影响新提交，而是立即作用于**已受理但尚未结束**的运行：
+
+- 绑定该版本且处于排队中（`PENDING`+queued）、退避等待中（`WAITING_RETRY`）或
+  执行中（`RUNNING`）的运行，以终态 `INVALIDATED` 收敛，
+  `failureCode=DEFINITION_WITHDRAWN`，`failureReason` 含撤回原因——
+  与普通失败（`FAILED*`/`NON_RETRYABLE_ERROR`）、普通取消（`CANCELLED`）完全可区分。
+- **后续不得再执行该版本**：推进循环在每个阶段边界检查绑定版本状态；版本一旦被撤回，
+  当前阶段如实完成后即停止，不再开始下一阶段；退避中的运行不再被推进，
+  `retry()` 对绑定已撤回版本的运行抛 `DEFINITION_WITHDRAWN`。
+- **历史保留**：此前已完成阶段的记录（状态、时间、错误）原样保留；运行不会被删除。
+- **隔离性**：同流水线的其它版本、其它运行、已有发布历史（含已 SUPERSEDED/ROLLED_BACK
+  记录）完全不受影响；已 `SUCCEEDED` 的运行保持原判，其发布仍可参与回滚。
+- 已在收敛途中的取消/中止优先：撤回不会把正在走向 `CANCELLED`/`ABORTED` 的运行
+  改判为 `INVALIDATED`。
+
+### 4.3 中断与容量、幂等的协同
+
+- `ABORTED` / `INVALIDATED` 都是终态，**立即释放在途槽位**；排队运行被终止时同时清除
+  `queued` 标记，**立即释放排队额度**，后续提交按既有 `max-in-flight` / `max-queued`
+  上限正常受理（取消路径同样修复为取消即释放排队额度）。
+- 幂等键索引在中断前后保持稳定：同一 key 的重复提交仍只对应同一次运行。
+  版本未被撤回时重复提交返回原运行（含其中断后的终态）；版本已撤回时按
+  `DEFINITION_WITHDRAWN` 明确拒绝（校验先于幂等判定），绝不创建新运行。
+- `ABORTED` / `INVALIDATED` 运行不可晋级（仅 `SUCCEEDED` 可 `promote`），
+  因此对发布与回滚链路零影响。
 
 ---
 
@@ -157,7 +215,8 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
   （定义、运行、幂等索引、发布、审计序列）。
 - `audit.jsonl`：**追加式、不可变** JSON-lines 审计日志，全局自增 `seq`。
 - 审计事件类型覆盖：定义创建 / 撤回、运行提交 / 去重 / 拒绝、阶段开始 / 成功 / 失败、
-  状态迁移、重试调度 / 执行、取消请求 / 完成、环境晋级、发布 / 取代 / 回滚、溢出。
+  状态迁移、重试调度 / 执行、取消请求 / 完成、中止请求 / 阶段被打断 / 中止完成、
+  版本失效终止（RUN_INVALIDATED）、环境晋级、发布 / 取代 / 回滚、溢出。
 - 每条事件携带 **pipeline、definitionVersion、runId、idempotencyKey、releaseId、
   from→to 状态、原因**，保证状态流转可追溯。
 - 单测日志通过 `pipeline.audit` logger 打印上述字段（见控制台输出）。
@@ -176,6 +235,7 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 | POST `/api/runs/{runId}/advance` | 推进下一阶段（含退避到期后的重试推进） |
 | POST `/api/runs/{runId}/retry` | 手动重试失败运行 |
 | POST `/api/runs/{runId}/cancel` | 请求取消 |
+| POST `/api/runs/{runId}/abort` | 立即中止（打断在途阶段，收敛 ABORTED） |
 | POST `/api/runs/{runId}/promote` | 晋级到下一环境 |
 | GET  `/api/pipelines/{p}/releases` | 发布历史（不丢弃） |
 | POST `/api/pipelines/{p}/environments/{env}/rollback` | 回滚当前发布到指定历史发布 |
@@ -194,7 +254,7 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 mvn test
 ```
 
-测试以「重复提交、越序晋级、失败重试、取消、回滚」为主，共 22 个用例：
+测试以「重复提交、越序晋级、失败重试、取消、立即中止、版本失效、回滚」为主，共 33 个用例：
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -203,6 +263,8 @@ mvn test
 | `PromotionTests` | 环境按序晋级、重复晋级拒绝、失败运行不能发布 |
 | `RetryTests` | 可重试成功、退避窗口拒绝、次数耗尽、不可重试立即终止并保留原因 |
 | `CancelTests` | PENDING 立即取消、重复取消不跳变、取消与重试并发收敛单终态 |
+| `AbortTests` | 执行中打断在途阶段且后续阶段不执行、PENDING/WAITING_RETRY 立即中止、重复中止幂等、终态中止抛 ABORT_NOT_ALLOWED、中止释放在途容量、中止与取消并发收敛单终态 |
+| `WithdrawInvalidationTests` | 撤回作用于排队中/退避中/执行中运行（INVALIDATED 且保留已完成阶段）、排队额度释放、撤回后重试/提交被拒绝、其它版本与发布历史隔离、幂等键跨中断稳定 |
 | `RollbackTests` | 回滚重新生效、完整有序历史、非法目标原因码区分 |
 | `ConcurrencyTests` | 16 线程并发推进每阶段仅一次；REJECT 上限拒绝；QUEUE 有界缓冲 + FIFO 泵 |
 | `PersistenceTests` | state.json / audit.jsonl 落盘与重载一致性 |

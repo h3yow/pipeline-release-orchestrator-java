@@ -34,6 +34,7 @@ final class TestEnv {
         this.audit = new AuditSupport(store);
         this.definitions = new DefaultDefinitionService(store, locks, audit);
         this.runs = new DefaultRunService(store, locks, definitions, audit, handler, properties);
+        this.definitions.setRunService(this.runs);
         this.releases = new DefaultReleaseService(store, locks, definitions, audit);    }
 
     static TestEnv create(StageHandler handler) {

@@ -6,6 +6,7 @@ import com.github.h3yow.pipelinereleaseorchestratorjava.exception.IdempotencyCon
 import com.github.h3yow.pipelinereleaseorchestratorjava.exception.IllegalTransitionException;
 import com.github.h3yow.pipelinereleaseorchestratorjava.exception.OverflowException;
 import com.github.h3yow.pipelinereleaseorchestratorjava.model.AuditType;
+import com.github.h3yow.pipelinereleaseorchestratorjava.model.DefinitionStatus;
 import com.github.h3yow.pipelinereleaseorchestratorjava.model.DefinitionVersion;
 import com.github.h3yow.pipelinereleaseorchestratorjava.model.PipelineDefinition;
 import com.github.h3yow.pipelinereleaseorchestratorjava.model.PipelineRun;
@@ -35,6 +36,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @Service
 public class DefaultRunService implements RunService {
@@ -48,6 +51,11 @@ public class DefaultRunService implements RunService {
     private final StageHandler stageHandler;
     private final OrchestratorProperties properties;
     private final ObjectMapper payloadMapper = new ObjectMapper().findAndRegisterModules();
+    /**
+     * Run id -> thread currently executing a stage of that run. Lets abort()
+     * interrupt a long-running stage without waiting for the pipeline lock.
+     */
+    private final ConcurrentMap<String, Thread> executingThreads = new ConcurrentHashMap<>();
     private volatile Clock clock = Clock.systemUTC();
 
     public DefaultRunService(LocalStateStore store, PipelineLockManager locks,
@@ -188,6 +196,13 @@ public class DefaultRunService implements RunService {
                         "run " + runId + " failed with a non-retryable error: "
                                 + run.getFailureReason());
             }
+            if (isBoundVersionWithdrawn(run)) {
+                // A withdrawn version must never execute again, even via manual retry.
+                throw new IllegalTransitionException(RejectReason.DEFINITION_WITHDRAWN,
+                        "run " + runId + " is bound to withdrawn definition version "
+                                + run.getPipelineName() + "@v" + run.getDefinitionVersion()
+                                + " and cannot be retried");
+            }
             if (run.getStatus() != RunStatus.FAILED && run.getStatus() != RunStatus.WAITING_RETRY) {
                 throw new IllegalTransitionException(RejectReason.NOT_FAILED,
                         "run " + runId + " is not in a retryable failed state (status="
@@ -228,7 +243,8 @@ public class DefaultRunService implements RunService {
                 case CANCELLED -> {
                     return run; // idempotent: repeated cancel never flips state
                 }
-                case SUCCEEDED, FAILED, FAILED_NON_RETRYABLE -> throw new IllegalTransitionException(
+                case SUCCEEDED, FAILED, FAILED_NON_RETRYABLE, ABORTED, INVALIDATED ->
+                        throw new IllegalTransitionException(
                         RejectReason.CANCEL_NOT_ALLOWED,
                         "run " + runId + " is terminal (" + run.getStatus() + ") and cannot be cancelled");
                 case CANCELLING -> {
@@ -239,6 +255,7 @@ public class DefaultRunService implements RunService {
                     run.setCancelRequested(true);
                     if (run.getStatus() == RunStatus.WAITING_RETRY || run.getStatus() == RunStatus.PENDING) {
                         // Nothing is executing: cancellation takes effect immediately and terminally.
+                        run.setQueued(false); // release the queue slot immediately
                         run.setFinishedAt(Instant.now(clock));
                         transition(run, RunStatus.CANCELLED, AuditType.RUN_CANCELLED, reason);
                     } else {
@@ -250,6 +267,66 @@ public class DefaultRunService implements RunService {
                 }
             }
             return run;
+        });
+    }
+
+    @Override
+    public PipelineRun abort(String runId, String reason) {
+        PipelineRun found = mustFindRun(runId);
+        // Lock-free stop signal BEFORE touching the pipeline lock: a drive loop
+        // executing a long stage on another thread observes the flag between stages,
+        // and interrupting the executing thread breaks the stage itself promptly.
+        if (!found.getStatus().isTerminal()) {
+            found.setAbortReason(reason);
+            found.setAbortRequested(true);
+            Thread executing = executingThreads.get(runId);
+            if (executing != null) {
+                executing.interrupt();
+            }
+        }
+        return locks.withLock(found.getPipelineName(), () -> {
+            PipelineRun run = mustFindRun(runId);
+            if (run.getStatus() == RunStatus.ABORTED) {
+                return run; // idempotent: repeated abort never changes the outcome
+            }
+            if (run.getStatus().isTerminal()) {
+                // The abort never took effect; do not leave a stale stop signal on
+                // an already finished run.
+                run.setAbortRequested(false);
+                run.setAbortReason(null);
+                throw new IllegalTransitionException(RejectReason.ABORT_NOT_ALLOWED,
+                        "run " + runId + " is terminal (" + run.getStatus()
+                                + ") and cannot be aborted");
+            }
+            run.setAbortReason(reason);
+            run.setAbortRequested(true);
+            audit.emit(AuditType.RUN_ABORT_REQUESTED, run.getPipelineName(),
+                    run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                    null, run.getStatus(), run.getStatus(), reason);
+            finishAborted(run, reason);
+            return run;
+        });
+    }
+
+    @Override
+    public List<PipelineRun> invalidateRunsForWithdrawnVersion(String pipelineName, int version,
+                                                               String reason) {
+        return locks.withLock(pipelineName, () -> {
+            List<PipelineRun> terminated = new ArrayList<>();
+            for (PipelineRun run : store.listRuns(pipelineName)) {
+                if (run.getDefinitionVersion() != version || run.getStatus().isTerminal()) {
+                    continue;
+                }
+                // Abort and cancel flows already in progress keep their own terminal state.
+                if (run.isAbortRequested() || run.isCancelRequested()
+                        || run.getStatus() == RunStatus.CANCELLING) {
+                    continue;
+                }
+                finishInvalidated(run, "definition version " + pipelineName + "@v" + version
+                        + " withdrawn mid-run" + (reason == null ? "" : ": " + reason));
+                terminated.add(run);
+            }
+            return terminated;
         });
     }
 
@@ -296,9 +373,15 @@ public class DefaultRunService implements RunService {
     // ---------------------------------------------------------------- state machine driving
 
     private PipelineRun drive(PipelineRun run) {
+        // An abort request always wins, regardless of the current non-terminal state.
+        if (run.isAbortRequested()) {
+            finishAborted(run, run.getAbortReason());
+            return run;
+        }
         // A cancel request while idle (PENDING/WAITING_RETRY) takes effect immediately.
         if (run.isCancelRequested() && run.getStatus() != RunStatus.CANCELLING
                 && run.getStatus() != RunStatus.RUNNING) {
+            run.setQueued(false);
             run.setFinishedAt(Instant.now(clock));
             transition(run, RunStatus.CANCELLED, AuditType.RUN_CANCELLED, "cancel request observed before execution");
             store.persistSnapshot();
@@ -312,6 +395,18 @@ public class DefaultRunService implements RunService {
                 break;
             }
             StageExecution stage = currentStage(run);
+
+            // Abort outranks every other in-flight decision.
+            if (run.isAbortRequested()) {
+                finishAborted(run, run.getAbortReason());
+                return run;
+            }
+            // A withdrawn definition version must never execute again: invalidate
+            // before the next stage starts (completed stages keep their records).
+            if (isBoundVersionWithdrawn(run)) {
+                finishInvalidated(run, withdrawnReason(run));
+                return run;
+            }
 
             if (run.getStatus() == RunStatus.CANCELLING || run.isCancelRequested()) {
                 // No stage is half-executed here (stage execution is synchronous under the lock),
@@ -340,12 +435,44 @@ public class DefaultRunService implements RunService {
                     "stage='" + stage.getName() + "' attempt=" + stage.getAttempts());
 
             StageResult result;
+            executingThreads.put(run.getRunId(), Thread.currentThread());
             try {
                 result = stageHandler.execute(spec, run, stage.getAttempts());
             } catch (Exception e) {
                 result = StageResult.fail(true, String.valueOf(e.getMessage()));
+            } finally {
+                executingThreads.remove(run.getRunId());
             }
             stage.setFinishedAt(Instant.now(clock));
+
+            // An abort requested while the stage was executing wins over its outcome:
+            // a genuinely completed stage keeps its honest success record, an
+            // interrupted one is marked ABORTED (never a success trace), and the run
+            // converges to ABORTED before any further stage is touched.
+            if (run.isAbortRequested()) {
+                if (result != null && result.success()) {
+                    stage.setStatus(StageStatus.SUCCEEDED);
+                    stage.setLastError(null);
+                    audit.emit(AuditType.RUN_STAGE_SUCCEEDED, run.getPipelineName(),
+                            run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                            null, run.getStatus(), run.getStatus(),
+                            "stage='" + stage.getName() + "' completed before abort landed");
+                    run.setCurrentStageIndex(run.getCurrentStageIndex() + 1);
+                } else {
+                    stage.setStatus(StageStatus.ABORTED);
+                    stage.setLastError("aborted during execution"
+                            + (result == null || result.errorMessage() == null
+                                    ? "" : ": " + result.errorMessage()));
+                    stage.setLastErrorRetryable(false);
+                    audit.emit(AuditType.RUN_STAGE_ABORTED, run.getPipelineName(),
+                            run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                            null, run.getStatus(), run.getStatus(),
+                            "stage='" + stage.getName() + "' interrupted by abort");
+                }
+                store.persistSnapshot();
+                finishAborted(run, run.getAbortReason());
+                return run;
+            }
 
             if (result != null && result.success()) {
                 stage.setStatus(StageStatus.SUCCEEDED);
@@ -355,6 +482,12 @@ public class DefaultRunService implements RunService {
                         run.getStatus(), run.getStatus(), "stage='" + stage.getName() + "'");
                 run.setCurrentStageIndex(run.getCurrentStageIndex() + 1);
                 store.persistSnapshot();
+                // Withdrawal observed between stages: never execute the withdrawn
+                // version again; converge to INVALIDATED with history preserved.
+                if (isBoundVersionWithdrawn(run)) {
+                    finishInvalidated(run, withdrawnReason(run));
+                    return run;
+                }
                 // A cancel intent may have been set on this run in a previous tick. Once the
                 // in-flight stage is done, converge to CANCELLED before touching the next stage
                 // (no duplicate advancement, no status bounce).
@@ -378,6 +511,13 @@ public class DefaultRunService implements RunService {
                     run.getRunId(), run.getIdempotencyKey(), null, run.getStatus(), run.getStatus(),
                     "stage='" + stage.getName() + "' retryable=" + retryable
                             + " error=" + stage.getLastError());
+
+            // The failed stage record stays as-is, but a withdrawn version must not be
+            // retried or failed through the normal path: converge to INVALIDATED.
+            if (isBoundVersionWithdrawn(run)) {
+                finishInvalidated(run, withdrawnReason(run));
+                return run;
+            }
 
             if (!retryable) {
                 finishFailed(run, RunStatus.FAILED_NON_RETRYABLE,
@@ -420,6 +560,69 @@ public class DefaultRunService implements RunService {
                 status == RunStatus.FAILED_NON_RETRYABLE ? AuditType.RUN_FAILED : AuditType.RUN_FAILED,
                 code + ": " + reason);
         store.persistSnapshot();
+    }
+
+    /**
+     * Converge to the ABORTED terminal state. Completed stages keep their results;
+     * a half-executed stage is marked ABORTED; never-started stages stay PENDING.
+     * Releases the in-flight/queue slot immediately.
+     */
+    private void finishAborted(PipelineRun run, String reason) {
+        StageExecution current = currentStage(run);
+        if (current != null && current.getStatus() == StageStatus.RUNNING) {
+            current.setStatus(StageStatus.ABORTED);
+            current.setFinishedAt(Instant.now(clock));
+            current.setLastError("aborted during execution");
+            current.setLastErrorRetryable(false);
+            audit.emit(AuditType.RUN_STAGE_ABORTED, run.getPipelineName(),
+                    run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                    null, run.getStatus(), run.getStatus(),
+                    "stage='" + current.getName() + "' interrupted by abort");
+        }
+        run.setQueued(false);
+        run.setFinishedAt(Instant.now(clock));
+        run.setFailureCode(RejectReason.RUN_ABORTED);
+        run.setFailureReason(reason);
+        transition(run, RunStatus.ABORTED, AuditType.RUN_ABORTED,
+                "aborted" + (reason == null ? "" : ": " + reason));
+        store.persistSnapshot();
+    }
+
+    /**
+     * Converge to the INVALIDATED terminal state: the bound definition version was
+     * withdrawn while the run was still acceptable-but-unfinished. Distinct from
+     * both failure and cancellation; completed stage records are preserved.
+     */
+    private void finishInvalidated(PipelineRun run, String reason) {
+        StageExecution current = currentStage(run);
+        if (current != null && current.getStatus() == StageStatus.RUNNING) {
+            current.setStatus(StageStatus.ABORTED);
+            current.setFinishedAt(Instant.now(clock));
+            current.setLastError("definition version withdrawn during execution");
+            current.setLastErrorRetryable(false);
+            audit.emit(AuditType.RUN_STAGE_ABORTED, run.getPipelineName(),
+                    run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                    null, run.getStatus(), run.getStatus(),
+                    "stage='" + current.getName() + "' interrupted by definition withdrawal");
+        }
+        run.setQueued(false);
+        run.setFinishedAt(Instant.now(clock));
+        run.setFailureCode(RejectReason.DEFINITION_WITHDRAWN);
+        run.setFailureReason(reason);
+        transition(run, RunStatus.INVALIDATED, AuditType.RUN_INVALIDATED, reason);
+        store.persistSnapshot();
+    }
+
+    private boolean isBoundVersionWithdrawn(PipelineRun run) {
+        DefinitionVersion dv = definitions.get(run.getPipelineName(), run.getDefinitionVersion());
+        return dv != null && dv.getStatus() == DefinitionStatus.WITHDRAWN;
+    }
+
+    private String withdrawnReason(PipelineRun run) {
+        DefinitionVersion dv = definitions.get(run.getPipelineName(), run.getDefinitionVersion());
+        String detail = dv == null || dv.getWithdrawReason() == null ? "" : ": " + dv.getWithdrawReason();
+        return "definition version " + run.getPipelineName() + "@v" + run.getDefinitionVersion()
+                + " withdrawn mid-run" + detail;
     }
 
     private void transition(PipelineRun run, RunStatus target, AuditType auditType, String reason) {

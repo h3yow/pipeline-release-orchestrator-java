@@ -6,5 +6,7 @@ public enum StageStatus {
     RUNNING,
     SUCCEEDED,
     FAILED,
-    SKIPPED
+    SKIPPED,
+    /** The stage was interrupted by an immediate abort before it could complete. */
+    ABORTED
 }

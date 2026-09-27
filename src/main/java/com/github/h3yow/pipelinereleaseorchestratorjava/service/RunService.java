@@ -25,6 +25,25 @@ public interface RunService {
     /** Request cancellation; no-op-ish idempotent for already terminal runs. */
     PipelineRun cancel(String runId, String reason);
 
+    /**
+     * Immediately abort a run: the in-flight stage is interrupted as soon as
+     * possible and the run converges to {@code ABORTED}. Completed stages keep
+     * their results; never-executed stages stay PENDING. Repeated aborts are
+     * idempotent; aborting an already terminal (non-aborted) run is rejected
+     * with {@code ABORT_NOT_ALLOWED}.
+     */
+    PipelineRun abort(String runId, String reason);
+
+    /**
+     * Terminate every non-terminal run bound to a withdrawn definition version.
+     * Affected runs converge to {@code INVALIDATED} (distinct from failure and
+     * cancellation); already-completed stage records are preserved. Runs already
+     * converging to CANCELLED are left to their cancel flow.
+     *
+     * @return the runs terminated by this call
+     */
+    List<PipelineRun> invalidateRunsForWithdrawnVersion(String pipelineName, int version, String reason);
+
     PipelineRun get(String runId);
 
     /**
