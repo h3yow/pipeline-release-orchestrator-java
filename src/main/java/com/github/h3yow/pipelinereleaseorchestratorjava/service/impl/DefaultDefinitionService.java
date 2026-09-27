@@ -12,6 +12,7 @@ import com.github.h3yow.pipelinereleaseorchestratorjava.model.PipelineDefinition
 import com.github.h3yow.pipelinereleaseorchestratorjava.model.RejectReason;
 import com.github.h3yow.pipelinereleaseorchestratorjava.model.StageSpec;
 import com.github.h3yow.pipelinereleaseorchestratorjava.service.DefinitionService;
+import com.github.h3yow.pipelinereleaseorchestratorjava.service.DefinitionWithdrawalListener;
 import com.github.h3yow.pipelinereleaseorchestratorjava.service.Hashes;
 import com.github.h3yow.pipelinereleaseorchestratorjava.service.PipelineLockManager;
 import com.github.h3yow.pipelinereleaseorchestratorjava.store.LocalStateStore;
@@ -28,12 +29,21 @@ public class DefaultDefinitionService implements DefinitionService {
     private final PipelineLockManager locks;
     private final AuditSupport audit;
     private final ObjectMapper contentMapper;
+    /**
+     * Registered by the run service after construction (breaks the dependency cycle):
+     * notified after a version is withdrawn so in-flight runs of that version terminate.
+     */
+    private volatile DefinitionWithdrawalListener withdrawalListener;
 
     public DefaultDefinitionService(LocalStateStore store, PipelineLockManager locks, AuditSupport audit) {
         this.store = store;
         this.locks = locks;
         this.audit = audit;
         this.contentMapper = new ObjectMapper().findAndRegisterModules();
+    }
+
+    public void setWithdrawalListener(DefinitionWithdrawalListener withdrawalListener) {
+        this.withdrawalListener = withdrawalListener;
     }
 
     @Override
@@ -54,19 +64,40 @@ public class DefaultDefinitionService implements DefinitionService {
 
     @Override
     public DefinitionVersion withdraw(String pipelineName, int version, String reason) {
-        return locks.withLock(pipelineName, () -> {
-            DefinitionVersion dv = mustFind(pipelineName, version);
-            if (dv.getStatus() == DefinitionStatus.WITHDRAWN) {
-                return dv;
+        // Lock-free pre-check + interruption signal: a long-running stage of a bound run
+        // may be holding the pipeline lock, so in-flight runs must be signaled before
+        // this thread blocks on the lock.
+        DefinitionVersion current = store.getDefinition(pipelineName, version);
+        if (current == null) {
+            throw new DefinitionRejectedException(RejectReason.DEFINITION_NOT_FOUND,
+                    "definition version not found: " + pipelineName + "@v" + version);
+        }
+        DefinitionWithdrawalListener listener = withdrawalListener;
+        if (current.getStatus() != DefinitionStatus.WITHDRAWN && listener != null) {
+            listener.signalDefinitionWithdrawn(pipelineName, version, reason);
+        }
+
+        boolean[] newlyWithdrawn = new boolean[1];
+        DefinitionVersion dv = locks.withLock(pipelineName, () -> {
+            DefinitionVersion found = mustFind(pipelineName, version);
+            if (found.getStatus() == DefinitionStatus.WITHDRAWN) {
+                return found;
             }
-            dv.setStatus(DefinitionStatus.WITHDRAWN);
-            dv.setWithdrawnAt(Instant.now());
-            dv.setWithdrawReason(reason);
+            found.setStatus(DefinitionStatus.WITHDRAWN);
+            found.setWithdrawnAt(Instant.now());
+            found.setWithdrawReason(reason);
+            newlyWithdrawn[0] = true;
             store.persistSnapshot();
             audit.emit(AuditType.DEFINITION_WITHDRAWN, pipelineName, version,
                     null, null, null, null, null, reason);
-            return dv;
+            return found;
         });
+        // Converge idle runs of the withdrawn version (executing runs converge in their
+        // own drive loop, already interrupted by the signal above).
+        if (newlyWithdrawn[0] && listener != null) {
+            listener.convergeWithdrawnRuns(pipelineName, version, reason);
+        }
+        return dv;
     }
 
     @Override

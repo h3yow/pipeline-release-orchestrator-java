@@ -26,6 +26,9 @@ config/     OrchestratorProperties（资源上限、退避、存储、溢出策�
   不同流水线互不阻塞。
 - **阶段执行在锁内同步完成**。取消与重试即使在另一线程并发发起，也只会在锁边界被串行处理，
   状态不会反复跳变，阶段不会被执行两次。
+- **立即中止 / 版本失效采用「锁外意图 + 锁内收敛」两阶段中断**：中止或撤回先在锁外登记
+  意图并 `interrupt()` 执行线程（长阶段立即被打断），再由推进循环在阶段边界收敛到
+  唯一终态；意图表仅驻留内存，重启后由「绑定版本是否 WITHDRAWN」的检查兜底。
 - 所有状态变更先更新内存对象，再 `persistSnapshot()`（临时文件 + 原子 move），并向
   `audit.jsonl` 追加一条不可变审计事件。
 
@@ -74,6 +77,9 @@ CANCELLED             ├──────────────────�
                       │
                       └─cancel(运行中)─> CANCELLING ─在阶段边界收敛─> CANCELLED
 WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
+
+任意非终态 ─abort─> ABORTED                        (终态，立即中止)
+任意非终态 ─绑定定义版本被撤回─> DEFINITION_REVOKED   (终态，版本失效)
 ```
 
 - 阶段严格按定义顺序执行。只有「下一个 `PENDING` 阶段」可执行；
@@ -101,6 +107,53 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 - **取消幂等**：对已 CANCELLED 重复取消状态不变；对 SUCCEEDED/FAILED 终态取消抛
   `CANCEL_NOT_ALLOWED`，历史不被翻转。
 - 取消与重试并发时由同一把锁串行化，最终**必然收敛到单一终态**，不会 CANCELLED↔RUNNING 抖动。
+
+### 立即中止（abort）
+
+`abort(runId, reason)` 用于「运行跑到一半必须马上叫停」的场景，与取消的区别是
+**尽快打断正在执行的阶段**，而不是等当前阶段自然跑完：
+
+- **两阶段中断**：先在**锁外**登记中止意图并 `interrupt()` 正在执行阶段的线程
+  （长阶段因此立即被打断，无需等待整轮推进结束）；再在流水线锁内收敛状态。
+  PENDING / WAITING_RETRY 直接收敛为 `ABORTED`；RUNNING 由持有锁的推进循环在
+  阶段边界收敛。
+- **结果如实保留**：中止前已跑完的阶段保留 `SUCCEEDED`；被打断的阶段记为
+  `INTERRUPTED`（绝不留下成功痕迹）；未执行的阶段保持 `PENDING`。
+- **唯一终态**：终态为 `ABORTED`，运行上记录 `failureCode=RUN_ABORTED` 与触发原因
+  `failureReason`；审计轨迹含 `RUN_ABORT_REQUESTED` → `RUN_ABORTED` 完整顺序。
+- **幂等与拒绝**：对 `ABORTED` 重复中止不改变结果；对其它终态（SUCCEEDED/FAILED/
+  CANCELLED/DEFINITION_REVOKED）中止抛 **`ABORT_NOT_ALLOWED`**（与
+  `CANCEL_NOT_ALLOWED` 可区分），消息中带实际终态。
+
+### 定义版本运行中途失效（withdraw 的扩散语义）
+
+`withdraw(pipeline, v, reason)` 除了把版本置为 `WITHDRAWN`，还会终止该版本
+**已受理但尚未结束**的运行（排队中 / 退避等待中 / 正在执行）：
+
+- 同样采用两阶段中断：先在**锁外**对该版本全部在途运行登记失效意图并中断执行线程，
+  再在锁内把空闲运行（PENDING / WAITING_RETRY，含排队运行）收敛为
+  **`DEFINITION_REVOKED`**；执行中的运行由其推进循环在阶段边界收敛。
+- 终止原因与普通失败、普通取消可区分：`failureCode=DEFINITION_WITHDRAWN`，
+  `failureReason` 为撤回原因；此前已完成阶段的记录原样保留。
+- **影响隔离**：同流水线的其它版本、其它运行、已有发布历史（ACTIVE/SUPERSEDED/
+  ROLLED_BACK）完全不受影响；已终态的运行不会被改写。
+- 失效版本此后**绝不再执行**：`advance` / `retry` / 队列泵在入口处检查绑定版本的
+  WITHDRAWN 状态，一律收敛为 `DEFINITION_REVOKED` 而不是继续推进
+  （重启后意图表丢失时也能靠版本状态检查兜底）。
+
+### 中断与既有机制的共存
+
+- **容量与排队额度即时释放**：`ABORTED` / `DEFINITION_REVOKED` 都是终态，不再占用
+  在途槽位；排队运行被终止时清除 `queued` 标记，后续提交按既有上限规则正常受理。
+- **并发无抖动**：中止 / 版本失效 / 取消 / 重试 / 晋级并发时，状态变更仍在同一把
+  流水线公平锁内串行收敛；锁外仅写「意图」，由推进循环在阶段边界统一下判，
+  不会重复推进、状态反复或半更新。
+- **幂等键一致**：同一幂等键在中断前后重复提交仍只对应同一次运行
+  （版本仍有效时去重返回原运行及其终态；版本已撤回时以 `DEFINITION_WITHDRAWN`
+  拒绝且不产生新运行），最终结果一致。
+- **运行详情可读中断原因**：`failureCode` / `failureReason` 给出本次中断触发原因，
+  审计轨迹（`RUN_ABORT_REQUESTED`/`RUN_ABORTED`/`RUN_DEFINITION_REVOKED` 等）
+  按 `seq` 给出完整状态流转顺序。
 
 ---
 
@@ -157,7 +210,8 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
   （定义、运行、幂等索引、发布、审计序列）。
 - `audit.jsonl`：**追加式、不可变** JSON-lines 审计日志，全局自增 `seq`。
 - 审计事件类型覆盖：定义创建 / 撤回、运行提交 / 去重 / 拒绝、阶段开始 / 成功 / 失败、
-  状态迁移、重试调度 / 执行、取消请求 / 完成、环境晋级、发布 / 取代 / 回滚、溢出。
+  状态迁移、重试调度 / 执行、取消请求 / 完成、中止请求 / 完成、版本失效终止、
+  环境晋级、发布 / 取代 / 回滚、溢出。
 - 每条事件携带 **pipeline、definitionVersion、runId、idempotencyKey、releaseId、
   from→to 状态、原因**，保证状态流转可追溯。
 - 单测日志通过 `pipeline.audit` logger 打印上述字段（见控制台输出）。
@@ -170,12 +224,13 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 |---|---|
 | POST `/api/pipelines/{p}/definitions` | 创建不可变定义版本 |
 | GET  `/api/pipelines/{p}/definitions[/{v}]` | 查询版本 |
-| POST `/api/pipelines/{p}/definitions/{v}/withdraw` | 撤回版本 |
+| POST `/api/pipelines/{p}/definitions/{v}/withdraw` | 撤回版本（在途运行收敛 DEFINITION_REVOKED） |
 | POST `/api/pipelines/{p}/runs` | 幂等提交运行（body 含 definitionVersion/idempotencyKey/payload） |
 | GET  `/api/runs/{runId}` | 查询运行 |
 | POST `/api/runs/{runId}/advance` | 推进下一阶段（含退避到期后的重试推进） |
 | POST `/api/runs/{runId}/retry` | 手动重试失败运行 |
 | POST `/api/runs/{runId}/cancel` | 请求取消 |
+| POST `/api/runs/{runId}/abort` | 立即中止（打断执行中阶段，收敛 ABORTED） |
 | POST `/api/runs/{runId}/promote` | 晋级到下一环境 |
 | GET  `/api/pipelines/{p}/releases` | 发布历史（不丢弃） |
 | POST `/api/pipelines/{p}/environments/{env}/rollback` | 回滚当前发布到指定历史发布 |
@@ -194,7 +249,7 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 mvn test
 ```
 
-测试以「重复提交、越序晋级、失败重试、取消、回滚」为主，共 22 个用例：
+测试以「重复提交、越序晋级、失败重试、取消、立即中止、版本失效、回滚」为主，共 33 个用例：
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -203,10 +258,12 @@ mvn test
 | `PromotionTests` | 环境按序晋级、重复晋级拒绝、失败运行不能发布 |
 | `RetryTests` | 可重试成功、退避窗口拒绝、次数耗尽、不可重试立即终止并保留原因 |
 | `CancelTests` | PENDING 立即取消、重复取消不跳变、取消与重试并发收敛单终态 |
+| `AbortTests` | 执行中立即中止且后续阶段不再执行、打断阶段记 INTERRUPTED、重复中止幂等、终态中止抛 ABORT_NOT_ALLOWED、容量释放与同键重提一致、中止/取消/推进并发收敛 |
+| `DefinitionRevocationTests` | 撤回作用于排队中 / 退避等待中 / 执行中的运行（DEFINITION_REVOKED）、阶段历史保留、容量与排队额度释放、其它版本 / 运行 / 发布历史隔离、撤回后同键重提不产生新运行 |
 | `RollbackTests` | 回滚重新生效、完整有序历史、非法目标原因码区分 |
 | `ConcurrencyTests` | 16 线程并发推进每阶段仅一次；REJECT 上限拒绝；QUEUE 有界缓冲 + FIFO 泵 |
 | `PersistenceTests` | state.json / audit.jsonl 落盘与重载一致性 |
-| `WebApiTests` | REST 全链路与 HTTP / 原因码映射 |
+| `WebApiTests` | REST 全链路与 HTTP / 原因码映射（含 abort 与撤回失效语义） |
 
 单测日志中可见形如：
 

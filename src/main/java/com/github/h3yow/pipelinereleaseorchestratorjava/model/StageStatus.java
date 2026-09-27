@@ -6,5 +6,7 @@ public enum StageStatus {
     RUNNING,
     SUCCEEDED,
     FAILED,
+    /** Broken off mid-execution by an abort / definition revocation; never a success trace. */
+    INTERRUPTED,
     SKIPPED
 }

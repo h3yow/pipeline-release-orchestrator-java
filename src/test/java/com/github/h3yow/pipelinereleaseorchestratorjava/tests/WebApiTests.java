@@ -111,4 +111,76 @@ class WebApiTests {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[0].seq").exists());
     }
+
+    @Test
+    void abortAndWithdrawalSemanticsOverHttp() throws Exception {
+        String created = mvc.perform(post("/api/pipelines/web2/definitions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(Map.of("definition", definition()))))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        int version = json.readTree(created).get("version").asInt();
+
+        // abort a PENDING run -> ABORTED with distinguishable code; repeated abort idempotent
+        var submitBody = Map.of("definitionVersion", version, "idempotencyKey", "web-abort",
+                "payload", Map.of());
+        String runJson = mvc.perform(post("/api/pipelines/web2/runs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(submitBody)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        String runId = json.readTree(runJson).get("runId").asText();
+
+        mvc.perform(post("/api/runs/{id}/abort", runId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(Map.of("reason", "halt now"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ABORTED"))
+                .andExpect(jsonPath("$.failureCode").value("RUN_ABORTED"))
+                .andExpect(jsonPath("$.failureReason").value("halt now"));
+        mvc.perform(post("/api/runs/{id}/abort", runId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(Map.of("reason", "again"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ABORTED"))
+                .andExpect(jsonPath("$.failureReason").value("halt now"));
+
+        // aborting a SUCCEEDED run -> 422 ABORT_NOT_ALLOWED
+        var submit2 = Map.of("definitionVersion", version, "idempotencyKey", "web-ok",
+                "payload", Map.of());
+        String run2Json = mvc.perform(post("/api/pipelines/web2/runs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(submit2)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        String run2Id = json.readTree(run2Json).get("runId").asText();
+        mvc.perform(post("/api/runs/{id}/advance", run2Id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SUCCEEDED"));
+        mvc.perform(post("/api/runs/{id}/abort", run2Id)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(Map.of("reason", "too late"))))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("ABORT_NOT_ALLOWED"));
+
+        // withdrawing the version revokes the in-flight run with a distinct terminal state
+        var submit3 = Map.of("definitionVersion", version, "idempotencyKey", "web-revoke",
+                "payload", Map.of());
+        String run3Json = mvc.perform(post("/api/pipelines/web2/runs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(submit3)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        String run3Id = json.readTree(run3Json).get("runId").asText();
+        mvc.perform(post("/api/pipelines/web2/definitions/{v}/withdraw", version)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsBytes(Map.of("reason", "recall"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("WITHDRAWN"));
+        mvc.perform(get("/api/runs/{id}", run3Id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("DEFINITION_REVOKED"))
+                .andExpect(jsonPath("$.failureCode").value("DEFINITION_WITHDRAWN"))
+                .andExpect(jsonPath("$.failureReason").value("recall"));
+    }
 }

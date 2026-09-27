@@ -23,6 +23,9 @@ public final class Requests {
     public record CancelRequest(String reason) {
     }
 
+    public record AbortRequest(String reason) {
+    }
+
     public record RollbackRequest(String targetReleaseId, String reason) {
     }
 }

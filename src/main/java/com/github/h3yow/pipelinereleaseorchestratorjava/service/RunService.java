@@ -25,6 +25,14 @@ public interface RunService {
     /** Request cancellation; no-op-ish idempotent for already terminal runs. */
     PipelineRun cancel(String runId, String reason);
 
+    /**
+     * Immediately abort an in-flight run: the executing stage is interrupted as soon as
+     * possible and the run converges to {@code ABORTED}. Repeated aborts on an already
+     * {@code ABORTED} run are idempotent; aborting any other terminal run is rejected
+     * with {@code ABORT_NOT_ALLOWED}.
+     */
+    PipelineRun abort(String runId, String reason);
+
     PipelineRun get(String runId);
 
     /**
