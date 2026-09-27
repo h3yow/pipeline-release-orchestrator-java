@@ -117,8 +117,12 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
   （长阶段因此立即被打断，无需等待整轮推进结束）；再在流水线锁内收敛状态。
   PENDING / WAITING_RETRY 直接收敛为 `ABORTED`；RUNNING 由持有锁的推进循环在
   阶段边界收敛。
-- **结果如实保留**：中止前已跑完的阶段保留 `SUCCEEDED`；被打断的阶段记为
-  `INTERRUPTED`（绝不留下成功痕迹）；未执行的阶段保持 `PENDING`。
+- **结果如实保留**：中止前已跑完的阶段保留 `SUCCEEDED`；**中止发生的那一刻正在执行、
+  但在中止窗口内真正跑完并正常返回的阶段，同样按真实结果保留**（正常返回成功记
+  `SUCCEEDED` 并推进游标，真实失败/抛异常记 `FAILED` 并保留原始错误，绝不会被
+  改写）；只有确实没跑完、被打断的那一步才记为 `INTERRUPTED`（绝不留下成功痕迹）；
+  未执行的阶段保持 `PENDING`。阶段结果在流水线锁内只判定一次，不会一会儿算完成、
+  一会儿又被改写。
 - **唯一终态**：终态为 `ABORTED`，运行上记录 `failureCode=RUN_ABORTED` 与触发原因
   `failureReason`；审计轨迹含 `RUN_ABORT_REQUESTED` → `RUN_ABORTED` 完整顺序。
 - **幂等与拒绝**：对 `ABORTED` 重复中止不改变结果；对其它终态（SUCCEEDED/FAILED/
@@ -135,6 +139,10 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
   **`DEFINITION_REVOKED`**；执行中的运行由其推进循环在阶段边界收敛。
 - 终止原因与普通失败、普通取消可区分：`failureCode=DEFINITION_WITHDRAWN`，
   `failureReason` 为撤回原因；此前已完成阶段的记录原样保留。
+- **已完成阶段保留语义与中止一致**：撤回发生的那一刻正在执行、但在失效窗口内
+  真正跑完并正常返回的阶段按真实结果保留（成功仍为 `SUCCEEDED`，真实失败仍为
+  `FAILED`）；只有确实没跑完、被打断的阶段记 `INTERRUPTED`；未轮到的阶段保持
+  `PENDING`，失效版本绝不再执行下一阶段。
 - **影响隔离**：同流水线的其它版本、其它运行、已有发布历史（ACTIVE/SUPERSEDED/
   ROLLED_BACK）完全不受影响；已终态的运行不会被改写。
 - 失效版本此后**绝不再执行**：`advance` / `retry` / 队列泵在入口处检查绑定版本的
@@ -249,7 +257,20 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 mvn test
 ```
 
-测试以「重复提交、越序晋级、失败重试、取消、立即中止、版本失效、回滚」为主，共 33 个用例：
+只验证「立即中止 / 版本失效」两条链路（含中止/失效窗口内阶段真正跑完的保留语义）：
+
+```bash
+mvn test -Dtest='AbortTests,DefinitionRevocationTests'
+```
+
+其中 `abortLandingAfterStageTrulyCompletedKeepsStageSuccess` 与
+`withdrawLandingAfterStageTrulyCompletedKeepsStageSuccess` 用「等待中断信号后再正常返回成功」
+的阶段处理器确定性地复现「中止/撤回发生时阶段正在执行、但在窗口内真正跑完」的场景，
+断言该阶段保留 `SUCCEEDED`、后续阶段保持 `PENDING`、运行仍收敛到 `ABORTED` /
+`DEFINITION_REVOKED`，且审计轨迹按 `RUN_STAGE_STARTED → RUN_STAGE_SUCCEEDED →
+RUN_ABORTED / RUN_DEFINITION_REVOKED` 顺序可查。
+
+测试以「重复提交、越序晋级、失败重试、取消、立即中止、版本失效、回滚」为主，共 36 个用例：
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -258,8 +279,8 @@ mvn test
 | `PromotionTests` | 环境按序晋级、重复晋级拒绝、失败运行不能发布 |
 | `RetryTests` | 可重试成功、退避窗口拒绝、次数耗尽、不可重试立即终止并保留原因 |
 | `CancelTests` | PENDING 立即取消、重复取消不跳变、取消与重试并发收敛单终态 |
-| `AbortTests` | 执行中立即中止且后续阶段不再执行、打断阶段记 INTERRUPTED、重复中止幂等、终态中止抛 ABORT_NOT_ALLOWED、容量释放与同键重提一致、中止/取消/推进并发收敛 |
-| `DefinitionRevocationTests` | 撤回作用于排队中 / 退避等待中 / 执行中的运行（DEFINITION_REVOKED）、阶段历史保留、容量与排队额度释放、其它版本 / 运行 / 发布历史隔离、撤回后同键重提不产生新运行 |
+| `AbortTests` | 执行中立即中止且后续阶段不再执行、打断阶段记 INTERRUPTED、**中止窗口内真正跑完的阶段保留 SUCCEEDED、窗口内真实失败保留 FAILED**、重复中止幂等、终态中止抛 ABORT_NOT_ALLOWED、容量释放与同键重提一致、中止/取消/推进并发收敛 |
+| `DefinitionRevocationTests` | 撤回作用于排队中 / 退避等待中 / 执行中的运行（DEFINITION_REVOKED）、阶段历史保留、**失效窗口内真正跑完的阶段保留 SUCCEEDED**、容量与排队额度释放、其它版本 / 运行 / 发布历史隔离、撤回后同键重提不产生新运行 |
 | `RollbackTests` | 回滚重新生效、完整有序历史、非法目标原因码区分 |
 | `ConcurrencyTests` | 16 线程并发推进每阶段仅一次；REJECT 上限拒绝；QUEUE 有界缓冲 + FIFO 泵 |
 | `PersistenceTests` | state.json / audit.jsonl 落盘与重载一致性 |

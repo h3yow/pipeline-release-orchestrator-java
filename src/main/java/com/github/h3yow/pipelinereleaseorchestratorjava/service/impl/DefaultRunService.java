@@ -487,9 +487,15 @@ public class DefaultRunService implements RunService, DefinitionWithdrawalListen
                     "stage='" + stage.getName() + "' attempt=" + stage.getAttempts());
 
             StageResult result;
+            boolean ranToCompletion = true;
             executingThreads.put(run.getRunId(), Thread.currentThread());
             try {
                 result = stageHandler.execute(spec, run, stage.getAttempts());
+            } catch (InterruptedException ie) {
+                // Broken off mid-execution by the abort / revocation interrupt: the attempt
+                // did not run to completion, so there is no trustworthy outcome to keep.
+                ranToCompletion = false;
+                result = StageResult.fail(true, String.valueOf(ie.getMessage()));
             } catch (Exception e) {
                 result = StageResult.fail(true, String.valueOf(e.getMessage()));
             } finally {
@@ -497,17 +503,49 @@ public class DefaultRunService implements RunService, DefinitionWithdrawalListen
             }
             stage.setFinishedAt(Instant.now(clock));
 
-            // An abort / revocation that landed while the stage was executing wins over the
-            // stage outcome: the interrupted attempt is untrustworthy, so it is recorded as
-            // INTERRUPTED (never a success trace) and the run converges to its terminal state.
-            if (hasAbortIntent(run)) {
-                markInterrupted(stage, "aborted while executing");
-                return finishAborted(run, "stage '" + stage.getName() + "' interrupted by abort");
-            }
-            if (hasRevocationIntent(run)) {
-                markInterrupted(stage, "definition version withdrawn while executing");
-                return finishRevoked(run, "stage '" + stage.getName()
-                        + "' interrupted: definition v" + run.getDefinitionVersion() + " withdrawn");
+            boolean abortPending = hasAbortIntent(run);
+            boolean revocationPending = !abortPending && hasRevocationIntent(run);
+            if (abortPending || revocationPending) {
+                // An abort / revocation landed while the stage was executing. The stage's
+                // own outcome is still recorded truthfully and decided exactly once (under
+                // the pipeline lock): a stage that truly ran to completion keeps its real
+                // result (success stays success, a genuine failure/exception stays a
+                // failure and is never rewritten as success); only an attempt that was
+                // genuinely broken off mid-execution is marked INTERRUPTED, which never
+                // leaves a success trace. The run itself still converges to its terminal
+                // state and never starts the next stage.
+                String window = abortPending ? "abort" : "revocation";
+                if (!ranToCompletion) {
+                    markInterrupted(stage, abortPending
+                            ? "aborted while executing"
+                            : "definition version withdrawn while executing");
+                } else if (result != null && result.success()) {
+                    stage.setStatus(StageStatus.SUCCEEDED);
+                    stage.setLastError(null);
+                    audit.emit(AuditType.RUN_STAGE_SUCCEEDED, run.getPipelineName(),
+                            run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                            null, run.getStatus(), run.getStatus(),
+                            "stage='" + stage.getName() + "' completed within the "
+                                    + window + " window");
+                    run.setCurrentStageIndex(run.getCurrentStageIndex() + 1);
+                } else {
+                    boolean retryable = result != null && result.retryable() && spec.retryable();
+                    stage.setStatus(StageStatus.FAILED);
+                    stage.setLastError(result == null ? "null result" : result.errorMessage());
+                    stage.setLastErrorRetryable(retryable);
+                    audit.emit(AuditType.RUN_STAGE_FAILED, run.getPipelineName(),
+                            run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(),
+                            null, run.getStatus(), run.getStatus(),
+                            "stage='" + stage.getName() + "' failed within the " + window
+                                    + " window retryable=" + retryable
+                                    + " error=" + stage.getLastError());
+                }
+                store.persistSnapshot();
+                if (abortPending) {
+                    return finishAborted(run, "abort converged at stage '" + stage.getName() + "'");
+                }
+                return finishRevoked(run, "definition v" + run.getDefinitionVersion()
+                        + " withdrawn; terminated at stage '" + stage.getName() + "'");
             }
 
             if (result != null && result.success()) {

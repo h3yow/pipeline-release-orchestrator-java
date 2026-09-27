@@ -100,6 +100,139 @@ class AbortTests {
     }
 
     @Test
+    void abortLandingAfterStageTrulyCompletedKeepsStageSuccess() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        AtomicInteger stageCalls = new AtomicInteger();
+        StageHandler completesDespiteInterrupt = new StageHandler() {
+            @Override
+            public StageResult execute(StageSpec stage, PipelineRun run, int attempt) {
+                stageCalls.incrementAndGet();
+                if ("build".equals(stage.name())) {
+                    entered.countDown();
+                    // The abort interrupt IS the deterministic signal that the abort intent
+                    // was registered while this stage was executing. The stage does not
+                    // respond to it (uninterruptible work) and truly runs to completion,
+                    // returning success normally inside the abort window.
+                    awaitInterrupt();
+                }
+                return StageResult.ok();
+            }
+        };
+        TestEnv env = TestEnv.create(completesDespiteInterrupt);
+        DefinitionVersion v = env.definitions.createVersion("svc",
+                definition("svc", 0, Duration.ZERO, List.of("dev"), "build", "test", "deploy"));
+        PipelineRun run = env.runs.submit("svc", v.getVersion(), "abort-window", Map.of());
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> advance = pool.submit(() -> env.runs.advance(run.getRunId()));
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "stage should have started");
+
+        // Called on this thread: phase 1 interrupts the executing stage (which then truly
+        // completes); phase 2 blocks on the pipeline lock until the drive loop converges.
+        PipelineRun aborted = env.runs.abort(run.getRunId(), "stop now");
+        advance.get(5, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        PipelineRun after = env.runs.get(run.getRunId());
+        log.info("[ABORT] key=abort-window status={} code={} stages={}",
+                after.getStatus(), after.getFailureCode(),
+                after.getStages().stream().map(s -> s.getName() + "=" + s.getStatus()).toList());
+
+        // The run still converges to ABORTED with its distinct reason...
+        assertEquals(RunStatus.ABORTED, aborted.getStatus());
+        assertEquals(RunStatus.ABORTED, after.getStatus());
+        assertEquals(RejectReason.RUN_ABORTED, after.getFailureCode());
+        assertEquals("stop now", after.getFailureReason());
+        // ...but the stage that truly ran to completion keeps its success as-is...
+        assertEquals(StageStatus.SUCCEEDED, after.getStages().get(0).getStatus());
+        assertEquals(null, after.getStages().get(0).getLastError());
+        // ...and the stages that never ran keep no trace of success.
+        assertEquals(StageStatus.PENDING, after.getStages().get(1).getStatus());
+        assertEquals(StageStatus.PENDING, after.getStages().get(2).getStatus());
+        assertEquals(1, stageCalls.get(), "the next stage never started after the abort");
+        assertEquals(0, env.store.countInFlight("svc"), "capacity released");
+
+        // The run detail and audit trail show the stage's true outcome in order:
+        // started -> abort requested -> stage succeeded -> run aborted.
+        List<AuditType> runEvents = env.store.auditTrail("svc").stream()
+                .filter(e -> run.getRunId().equals(e.getRunId()))
+                .map(AuditEvent::getType).toList();
+        log.info("[ABORT] audit sequence={}", runEvents);
+        assertTrue(runEvents.indexOf(AuditType.RUN_STAGE_STARTED)
+                < runEvents.indexOf(AuditType.RUN_ABORT_REQUESTED));
+        assertTrue(runEvents.indexOf(AuditType.RUN_ABORT_REQUESTED)
+                < runEvents.indexOf(AuditType.RUN_STAGE_SUCCEEDED));
+        assertTrue(runEvents.indexOf(AuditType.RUN_STAGE_SUCCEEDED)
+                < runEvents.indexOf(AuditType.RUN_ABORTED));
+
+        // Repeated abort stays idempotent and never rewrites the kept stage result.
+        PipelineRun again = env.runs.abort(run.getRunId(), "again");
+        assertEquals(RunStatus.ABORTED, again.getStatus());
+        assertEquals(StageStatus.SUCCEEDED, again.getStages().get(0).getStatus());
+        assertEquals(after.getFinishedAt(), again.getFinishedAt());
+    }
+
+    @Test
+    void abortWindowStageFailureIsKeptAsFailureNeverSuccess() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        StageHandler failsAfterInterrupt = new StageHandler() {
+            @Override
+            public StageResult execute(StageSpec stage, PipelineRun run, int attempt) {
+                if ("build".equals(stage.name())) {
+                    entered.countDown();
+                    awaitInterrupt(); // abort lands while executing...
+                    return StageResult.fail(true, "real breakage"); // ...then genuinely fails
+                }
+                return StageResult.ok();
+            }
+        };
+        TestEnv env = TestEnv.create(failsAfterInterrupt);
+        DefinitionVersion v = env.definitions.createVersion("svc",
+                definition("svc", 0, Duration.ZERO, List.of("dev"), "build", "test"));
+        PipelineRun run = env.runs.submit("svc", v.getVersion(), "abort-window-fail", Map.of());
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> advance = pool.submit(() -> env.runs.advance(run.getRunId()));
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+        env.runs.abort(run.getRunId(), "stop during failing stage");
+        advance.get(5, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        PipelineRun after = env.runs.get(run.getRunId());
+        log.info("[ABORT] key=abort-window-fail status={} stages={}", after.getStatus(),
+                after.getStages().stream().map(s -> s.getName() + "=" + s.getStatus()).toList());
+        assertEquals(RunStatus.ABORTED, after.getStatus());
+        assertEquals(RejectReason.RUN_ABORTED, after.getFailureCode());
+        // The genuine failure is preserved as a failure, never rewritten as success.
+        assertEquals(StageStatus.FAILED, after.getStages().get(0).getStatus());
+        assertEquals("real breakage", after.getStages().get(0).getLastError());
+        assertEquals(StageStatus.PENDING, after.getStages().get(1).getStatus());
+        List<AuditType> runEvents = env.store.auditTrail("svc").stream()
+                .filter(e -> run.getRunId().equals(e.getRunId()))
+                .map(AuditEvent::getType).toList();
+        assertTrue(runEvents.contains(AuditType.RUN_STAGE_FAILED));
+        assertTrue(runEvents.indexOf(AuditType.RUN_STAGE_FAILED)
+                < runEvents.indexOf(AuditType.RUN_ABORTED));
+    }
+
+    /** Waits until this thread is interrupted (the abort/revocation signal), then returns. */
+    private static void awaitInterrupt() {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (System.nanoTime() < deadline) {
+            if (Thread.currentThread().isInterrupted()) {
+                return;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                return; // interrupted: the abort/revocation intent is now registered
+            }
+        }
+        throw new IllegalStateException("stage was never interrupted within 10s");
+    }
+
+    @Test
     void abortOnTerminalRunIsRejectedWithDistinctReason() {
         TestEnv env = TestEnv.create(new AlwaysSucceedStageHandler());
         DefinitionVersion v = env.definitions.createVersion("svc",

@@ -154,6 +154,91 @@ class DefinitionRevocationTests {
     }
 
     @Test
+    void withdrawLandingAfterStageTrulyCompletedKeepsStageSuccess() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        AtomicInteger stageCalls = new AtomicInteger();
+        StageHandler completesDespiteInterrupt = new StageHandler() {
+            @Override
+            public StageResult execute(StageSpec stage, PipelineRun run, int attempt) {
+                stageCalls.incrementAndGet();
+                if ("build".equals(stage.name())) {
+                    entered.countDown();
+                    // The withdrawal interrupt IS the deterministic signal that the
+                    // revocation intent was registered while this stage was executing.
+                    // The stage does not respond to it (uninterruptible work) and truly
+                    // runs to completion, returning success inside the revocation window.
+                    awaitInterrupt();
+                }
+                return StageResult.ok();
+            }
+        };
+        TestEnv env = TestEnv.create(completesDespiteInterrupt);
+        DefinitionVersion v = env.definitions.createVersion("svc",
+                definition("svc", 0, Duration.ZERO, List.of("dev"), "build", "test", "deploy"));
+        PipelineRun run = env.runs.submit("svc", v.getVersion(), "revoke-window", Map.of());
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> advance = pool.submit(() -> env.runs.advance(run.getRunId()));
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "stage should have started");
+
+        // Called on this thread: the lock-free signal interrupts the executing stage (which
+        // then truly completes); the lock-held part proceeds once the drive loop converges.
+        env.definitions.withdraw("svc", v.getVersion(), "urgent recall");
+        advance.get(5, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        PipelineRun after = env.runs.get(run.getRunId());
+        log.info("[REVOKE] key=revoke-window status={} code={} stages={}",
+                after.getStatus(), after.getFailureCode(),
+                after.getStages().stream().map(s -> s.getName() + "=" + s.getStatus()).toList());
+
+        // The run converges to DEFINITION_REVOKED with its distinct reason...
+        assertEquals(RunStatus.DEFINITION_REVOKED, after.getStatus());
+        assertEquals(RejectReason.DEFINITION_WITHDRAWN, after.getFailureCode());
+        assertEquals("urgent recall", after.getFailureReason());
+        // ...but the stage that truly ran to completion keeps its success as-is...
+        assertEquals(StageStatus.SUCCEEDED, after.getStages().get(0).getStatus());
+        assertEquals(null, after.getStages().get(0).getLastError());
+        // ...and the stages of the withdrawn version that never ran keep no success trace.
+        assertEquals(StageStatus.PENDING, after.getStages().get(1).getStatus());
+        assertEquals(StageStatus.PENDING, after.getStages().get(2).getStatus());
+        assertEquals(1, stageCalls.get(), "the next stage of the withdrawn version never ran");
+        assertEquals(0, env.store.countInFlight("svc"), "capacity released");
+
+        // The audit trail shows the stage's true outcome in order:
+        // started -> stage succeeded -> run revoked.
+        List<AuditType> runEvents = env.store.auditTrail("svc").stream()
+                .filter(e -> run.getRunId().equals(e.getRunId()))
+                .map(AuditEvent::getType).toList();
+        log.info("[REVOKE] audit sequence={}", runEvents);
+        assertTrue(runEvents.indexOf(AuditType.RUN_STAGE_STARTED)
+                < runEvents.indexOf(AuditType.RUN_STAGE_SUCCEEDED));
+        assertTrue(runEvents.indexOf(AuditType.RUN_STAGE_SUCCEEDED)
+                < runEvents.indexOf(AuditType.RUN_DEFINITION_REVOKED));
+
+        // The withdrawn version never executes again; the kept stage result is not rewritten.
+        assertThrows(Exception.class, () -> env.runs.advance(run.getRunId()));
+        assertEquals(StageStatus.SUCCEEDED, env.runs.get(run.getRunId()).getStages().get(0).getStatus());
+        assertEquals(1, stageCalls.get());
+    }
+
+    /** Waits until this thread is interrupted (the abort/revocation signal), then returns. */
+    private static void awaitInterrupt() {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (System.nanoTime() < deadline) {
+            if (Thread.currentThread().isInterrupted()) {
+                return;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                return; // interrupted: the revocation intent is now registered
+            }
+        }
+        throw new IllegalStateException("stage was never interrupted within 10s");
+    }
+
+    @Test
     void withdrawSparesOtherVersionsOtherRunsAndReleaseHistory() {
         TestEnv env = TestEnv.create(new AlwaysSucceedStageHandler());
         DefinitionVersion v1 = env.definitions.createVersion("svc",
