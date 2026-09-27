@@ -154,6 +154,78 @@ class DefinitionRevocationTests {
     }
 
     @Test
+    void withdrawAfterStageTrulyCompletedKeepsStageSuccess() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        AtomicInteger stageCalls = new AtomicInteger();
+        StageHandler completesDespiteInterrupt = new StageHandler() {
+            @Override
+            public StageResult execute(StageSpec stage, PipelineRun run, int attempt) {
+                stageCalls.incrementAndGet();
+                if ("build".equals(stage.name())) {
+                    entered.countDown();
+                    try {
+                        // Parked until the withdrawal interrupt arrives; the stage
+                        // nevertheless runs to completion inside the revocation window
+                        // and returns success.
+                        Thread.sleep(30_000);
+                    } catch (InterruptedException e) {
+                        // withdrawal landed mid-execution; the work itself was already done
+                    }
+                }
+                return StageResult.ok();
+            }
+        };
+        TestEnv env = TestEnv.create(completesDespiteInterrupt);
+        DefinitionVersion v = env.definitions.createVersion("svc",
+                definition("svc", 0, Duration.ZERO, List.of("dev"), "build", "test", "deploy"));
+        PipelineRun run = env.runs.submit("svc", v.getVersion(), "revoke-late", Map.of());
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        Future<?> advance = pool.submit(() -> env.runs.advance(run.getRunId()));
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "stage should have started");
+
+        env.definitions.withdraw("svc", v.getVersion(), "recall after build done");
+        advance.get(5, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        PipelineRun after = env.runs.get(run.getRunId());
+        log.info("[REVOKE] key=revoke-late status={} code={} stages={}",
+                after.getStatus(), after.getFailureCode(),
+                after.getStages().stream().map(s -> s.getName() + "=" + s.getStatus()).toList());
+
+        // The run still converges to the revocation terminal state...
+        assertEquals(RunStatus.DEFINITION_REVOKED, after.getStatus());
+        assertEquals(RejectReason.DEFINITION_WITHDRAWN, after.getFailureCode());
+        assertEquals("recall after build done", after.getFailureReason());
+        // ...but the stage that truly completed inside the revocation window keeps its
+        // success, it is never rewritten to INTERRUPTED.
+        assertEquals(StageStatus.SUCCEEDED, after.getStages().get(0).getStatus());
+        assertEquals(1, after.getStages().get(0).getAttempts());
+        assertEquals(1, after.getCurrentStageIndex());
+        // Stages that never ran keep no success trace, and the withdrawn version
+        // never executes again.
+        assertEquals(StageStatus.PENDING, after.getStages().get(1).getStatus());
+        assertEquals(StageStatus.PENDING, after.getStages().get(2).getStatus());
+        assertEquals(1, stageCalls.get());
+        // Capacity released by the terminal run.
+        assertEquals(0, env.store.countInFlight("svc"));
+
+        // The audit trail shows the genuine stage result before the run-level convergence.
+        List<AuditType> types = env.store.auditTrail("svc").stream()
+                .filter(e -> run.getRunId().equals(e.getRunId()))
+                .map(AuditEvent::getType).toList();
+        log.info("[REVOKE] audit sequence={}", types);
+        assertTrue(types.contains(AuditType.RUN_STAGE_SUCCEEDED));
+        assertTrue(types.contains(AuditType.RUN_DEFINITION_REVOKED));
+        assertTrue(types.indexOf(AuditType.RUN_STAGE_SUCCEEDED)
+                < types.indexOf(AuditType.RUN_DEFINITION_REVOKED));
+
+        // No further execution of the withdrawn version is possible.
+        assertThrows(Exception.class, () -> env.runs.advance(run.getRunId()));
+        assertEquals(1, stageCalls.get(), "withdrawn version never executes again");
+    }
+
+    @Test
     void withdrawSparesOtherVersionsOtherRunsAndReleaseHistory() {
         TestEnv env = TestEnv.create(new AlwaysSucceedStageHandler());
         DefinitionVersion v1 = env.definitions.createVersion("svc",

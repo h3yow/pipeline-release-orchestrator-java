@@ -117,10 +117,14 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
   （长阶段因此立即被打断，无需等待整轮推进结束）；再在流水线锁内收敛状态。
   PENDING / WAITING_RETRY 直接收敛为 `ABORTED`；RUNNING 由持有锁的推进循环在
   阶段边界收敛。
-- **结果如实保留**：中止前已跑完的阶段保留 `SUCCEEDED`；被打断的阶段记为
-  `INTERRUPTED`（绝不留下成功痕迹）；未执行的阶段保持 `PENDING`。
+- **结果如实保留**：中止前已跑完的阶段保留 `SUCCEEDED`；**中止窗口内真正跑完的阶段
+  同样照原样保留**——只要阶段处理器正常返回，返回成功记 `SUCCEEDED`（并推进游标），
+  真实返回的失败记 `FAILED`（绝不会被改写成成功）；只有确实没跑完（执行被打断、
+  未正常返回）的阶段才记为 `INTERRUPTED`（绝不留下成功痕迹）；未执行的阶段保持
+  `PENDING`。即使最后一个阶段在中止窗口内完成，运行本身仍收敛为 `ABORTED`。
 - **唯一终态**：终态为 `ABORTED`，运行上记录 `failureCode=RUN_ABORTED` 与触发原因
-  `failureReason`；审计轨迹含 `RUN_ABORT_REQUESTED` → `RUN_ABORTED` 完整顺序。
+  `failureReason`；审计轨迹含 `RUN_ABORT_REQUESTED` → （阶段真实结果
+  `RUN_STAGE_SUCCEEDED`/`RUN_STAGE_FAILED`）→ `RUN_ABORTED` 完整顺序。
 - **幂等与拒绝**：对 `ABORTED` 重复中止不改变结果；对其它终态（SUCCEEDED/FAILED/
   CANCELLED/DEFINITION_REVOKED）中止抛 **`ABORT_NOT_ALLOWED`**（与
   `CANCEL_NOT_ALLOWED` 可区分），消息中带实际终态。
@@ -134,7 +138,9 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
   再在锁内把空闲运行（PENDING / WAITING_RETRY，含排队运行）收敛为
   **`DEFINITION_REVOKED`**；执行中的运行由其推进循环在阶段边界收敛。
 - 终止原因与普通失败、普通取消可区分：`failureCode=DEFINITION_WITHDRAWN`，
-  `failureReason` 为撤回原因；此前已完成阶段的记录原样保留。
+  `failureReason` 为撤回原因；此前已完成阶段的记录原样保留，**失效窗口内真正跑完
+  的阶段同样保留真实结果**（正常返回成功记 `SUCCEEDED`、真实返回失败记 `FAILED`），
+  只有确实没跑完的阶段记 `INTERRUPTED`，未轮到的阶段保持 `PENDING`。
 - **影响隔离**：同流水线的其它版本、其它运行、已有发布历史（ACTIVE/SUPERSEDED/
   ROLLED_BACK）完全不受影响；已终态的运行不会被改写。
 - 失效版本此后**绝不再执行**：`advance` / `retry` / 队列泵在入口处检查绑定版本的
@@ -249,7 +255,23 @@ WAITING_RETRY ─cancel─> CANCELLED   （退避中取消立即终止）
 mvn test
 ```
 
-测试以「重复提交、越序晋级、失败重试、取消、立即中止、版本失效、回滚」为主，共 33 个用例：
+只验证「中止 / 版本失效时已完成阶段的保留语义」可单独跑这两条链路：
+
+```bash
+mvn test -Dtest='AbortTests,DefinitionRevocationTests'
+# 关键用例：
+#  AbortTests#abortAfterStageTrulyCompletedKeepsStageSuccess
+#  AbortTests#abortAfterLastStageCompletedStillConvergesToAborted
+#  AbortTests#abortWithStageGenuineFailureNeverRecordsSuccess
+#  DefinitionRevocationTests#withdrawAfterStageTrulyCompletedKeepsStageSuccess
+```
+
+这些用例让阶段处理器在中止/撤回中断到达后仍正常返回成功（或真实失败），确定性地复现
+「执行中的阶段在中止窗口内真正跑完」：断言该阶段保留 `SUCCEEDED`（或 `FAILED`）、
+后续阶段保持 `PENDING`、运行收敛到 `ABORTED` / `DEFINITION_REVOKED`，且审计轨迹中
+阶段真实结果事件先于运行终态事件。
+
+测试以「重复提交、越序晋级、失败重试、取消、立即中止、版本失效、回滚」为主，共 37 个用例：
 
 | 测试类 | 覆盖点 |
 |---|---|
@@ -258,8 +280,8 @@ mvn test
 | `PromotionTests` | 环境按序晋级、重复晋级拒绝、失败运行不能发布 |
 | `RetryTests` | 可重试成功、退避窗口拒绝、次数耗尽、不可重试立即终止并保留原因 |
 | `CancelTests` | PENDING 立即取消、重复取消不跳变、取消与重试并发收敛单终态 |
-| `AbortTests` | 执行中立即中止且后续阶段不再执行、打断阶段记 INTERRUPTED、重复中止幂等、终态中止抛 ABORT_NOT_ALLOWED、容量释放与同键重提一致、中止/取消/推进并发收敛 |
-| `DefinitionRevocationTests` | 撤回作用于排队中 / 退避等待中 / 执行中的运行（DEFINITION_REVOKED）、阶段历史保留、容量与排队额度释放、其它版本 / 运行 / 发布历史隔离、撤回后同键重提不产生新运行 |
+| `AbortTests` | 执行中立即中止且后续阶段不再执行、打断阶段记 INTERRUPTED、**中止窗口内真正跑完的阶段保留 SUCCEEDED（含最后一个阶段完成仍收敛 ABORTED）、窗口内真实失败记 FAILED 绝不成成功**、重复中止幂等、终态中止抛 ABORT_NOT_ALLOWED、容量释放与同键重提一致、中止/取消/推进并发收敛 |
+| `DefinitionRevocationTests` | 撤回作用于排队中 / 退避等待中 / 执行中的运行（DEFINITION_REVOKED）、**失效窗口内真正跑完的阶段保留 SUCCEEDED**、阶段历史保留、容量与排队额度释放、其它版本 / 运行 / 发布历史隔离、撤回后同键重提不产生新运行 |
 | `RollbackTests` | 回滚重新生效、完整有序历史、非法目标原因码区分 |
 | `ConcurrencyTests` | 16 线程并发推进每阶段仅一次；REJECT 上限拒绝；QUEUE 有界缓冲 + FIFO 泵 |
 | `PersistenceTests` | state.json / audit.jsonl 落盘与重载一致性 |

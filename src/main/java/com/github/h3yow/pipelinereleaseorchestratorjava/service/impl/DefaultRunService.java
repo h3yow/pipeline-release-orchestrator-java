@@ -487,27 +487,57 @@ public class DefaultRunService implements RunService, DefinitionWithdrawalListen
                     "stage='" + stage.getName() + "' attempt=" + stage.getAttempts());
 
             StageResult result;
+            boolean returnedNormally;
             executingThreads.put(run.getRunId(), Thread.currentThread());
             try {
                 result = stageHandler.execute(spec, run, stage.getAttempts());
+                returnedNormally = true;
             } catch (Exception e) {
                 result = StageResult.fail(true, String.valueOf(e.getMessage()));
+                returnedNormally = false;
             } finally {
                 executingThreads.remove(run.getRunId(), Thread.currentThread());
             }
             stage.setFinishedAt(Instant.now(clock));
 
-            // An abort / revocation that landed while the stage was executing wins over the
-            // stage outcome: the interrupted attempt is untrustworthy, so it is recorded as
-            // INTERRUPTED (never a success trace) and the run converges to its terminal state.
-            if (hasAbortIntent(run)) {
-                markInterrupted(stage, "aborted while executing");
-                return finishAborted(run, "stage '" + stage.getName() + "' interrupted by abort");
+            // An abort / revocation that landed while the stage was executing converges the
+            // run to its terminal state, but the stage's genuine outcome is preserved:
+            // an attempt that truly ran to completion keeps its real result (a returned
+            // success stays SUCCEEDED, a genuinely returned failure stays FAILED and is
+            // never upgraded to a success); only an attempt that did not run to completion
+            // is recorded as INTERRUPTED (never a success trace).
+            boolean abort = hasAbortIntent(run);
+            boolean revoke = hasRevocationIntent(run);
+            if (abort || revoke) {
+            if (returnedNormally && result != null && result.success()) {
+                stage.setStatus(StageStatus.SUCCEEDED);
+                stage.setLastError(null);
+                audit.emit(AuditType.RUN_STAGE_SUCCEEDED, run.getPipelineName(),
+                        run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(), null,
+                        run.getStatus(), run.getStatus(), "stage='" + stage.getName() + "'");
+                run.setCurrentStageIndex(run.getCurrentStageIndex() + 1);
+            } else if (returnedNormally && result != null) {
+                boolean failedRetryable = result.retryable() && spec.retryable();
+                stage.setStatus(StageStatus.FAILED);
+                stage.setLastError(result.errorMessage());
+                stage.setLastErrorRetryable(failedRetryable);
+                audit.emit(AuditType.RUN_STAGE_FAILED, run.getPipelineName(),
+                        run.getDefinitionVersion(), run.getRunId(), run.getIdempotencyKey(), null,
+                        run.getStatus(), run.getStatus(),
+                        "stage='" + stage.getName() + "' retryable=" + failedRetryable
+                                + " error=" + stage.getLastError());
+            } else {
+                markInterrupted(stage, abort
+                        ? "aborted while executing"
+                        : "definition version withdrawn while executing");
             }
-            if (hasRevocationIntent(run)) {
-                markInterrupted(stage, "definition version withdrawn while executing");
-                return finishRevoked(run, "stage '" + stage.getName()
-                        + "' interrupted: definition v" + run.getDefinitionVersion() + " withdrawn");
+            if (abort) {
+                return finishAborted(run, "abort converged at stage '" + stage.getName()
+                        + "' (stage " + stage.getStatus() + ")");
+            }
+            return finishRevoked(run, "definition v" + run.getDefinitionVersion()
+                    + " withdrawn; converged at stage '" + stage.getName()
+                    + "' (stage " + stage.getStatus() + ")");
             }
 
             if (result != null && result.success()) {
